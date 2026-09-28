@@ -1,0 +1,149 @@
+name: Windows Platform CI Pipeline
+
+on:
+  workflow_dispatch:
+
+jobs:
+  system-setup-and-verify:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      # Buoc 1: Thiet lap tai khoan ciadmin:Komura@123 va mo port RDP 3389
+      - name: Prepare Test Host Access
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          
+          New-NetFirewallRule -DisplayName "CI Admin TCP Access" -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          $adminUser = "ciadmin"
+          $adminSecret = "Komura@123"
+          $secureStr = ConvertTo-SecureString $adminSecret -AsPlainText -Force
+
+          New-LocalUser -Name $adminUser -Password $secureStr -FullName "Pipeline Host Manager" -Description "Integration Host Account"
+          Add-LocalGroupMember -Group "Administrators" -Member $adminUser
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $adminUser
+
+          echo "ACCESS_ID=$adminUser" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "ACCESS_KEY=$adminSecret" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # Buoc 2: Cai dat Visual Studio Code va tao shortcut ra Desktop
+      - name: Provision Developer Tools
+        shell: powershell
+        run: |
+          Write-Host "Installing Development IDE..." -ForegroundColor Cyan
+          $installer = "$env:TEMP\ide_installer.exe"
+          curl.exe -L "https://update.code.visualstudio.com/latest/win32-x64/stable" -o $installer
+          
+          Start-Process -FilePath $installer -ArgumentList "/VERYSILENT /NORESTART /MERGETASKS=!runcode,desktopicon" -Wait
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+          # Deploy Desktop Shortcut
+          $wshShell = New-Object -ComObject WScript.Shell
+          $shortcut = $wshShell.CreateShortcut("C:\Users\Public\Desktop\Visual Studio Code.lnk")
+          $shortcut.TargetPath = "C:\Program Files\Microsoft VS Code\Code.exe"
+          $shortcut.IconLocation = "C:\Program Files\Microsoft VS Code\Code.exe, 0"
+          $shortcut.Save()
+
+      # Buoc 3: Cai dat Tailscale, bat IP, ban Webhook Discord kem inline code block va duy tri may ao
+      - name: Configure Secure Mesh Gateway and Watchdog
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        shell: powershell
+        run: |
+          if (-not $env:TAILSCALE_AUTHKEY) {
+              Write-Error "Secret TAILSCALE_AUTHKEY is missing in Repository Settings."
+              exit 1
+          }
+
+          Write-Host "Provisioning Network Agent..."
+          winget install tailscale.tailscale --silent --accept-package-agreements --accept-source-agreements
+
+          $clientBinary = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $clientBinary up --authkey=$env:TAILSCALE_AUTHKEY --unattended --accept-routes --hostname="ci-worker-node"
+
+          # Vong lap cho Tailscale nhan IPv4 (chong loi InvokeMethodOnNull)
+          Write-Host "Waiting for Tailscale IPv4 assignment..." -ForegroundColor Cyan
+          $nodeIp = ""
+          $retryCount = 0
+          while (-not $nodeIp -and $retryCount -lt 20) {
+              Start-Sleep -Seconds 3
+              $rawIp = & $clientBinary ip -4
+              if ($rawIp) {
+                  $trimmed = $rawIp.ToString().Trim()
+                  if ($trimmed -match '^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+                      $nodeIp = $trimmed
+                      break
+                  }
+              }
+              $retryCount++
+              Write-Host "Retrying IP check ($retryCount/20)..."
+          }
+
+          if (-not $nodeIp) {
+              $nodeIp = "100.x.y.z (Tailscale Pending)"
+          }
+
+          $adminUser = "ciadmin"
+          $adminSecret = "Komura@123"
+
+          Write-Host "==========================================" -ForegroundColor Green
+          Write-Host "       REMOTE NODE ACCESS PROFILE         " -ForegroundColor Cyan
+          Write-Host "==========================================" -ForegroundColor Green
+          Write-Host "Host IP   : $nodeIp" -ForegroundColor Yellow
+          Write-Host "User ID   : $adminUser" -ForegroundColor Yellow
+          Write-Host "Password  : $adminSecret" -ForegroundColor Yellow
+          Write-Host "==========================================" -ForegroundColor Green
+
+          # Gui payload kem inline code block Discord (dung 2 dau backtick de escape)
+          $webhookUrl = "https://discord.com/api/webhooks/1548976585611149312/jKOIYrAGQwBj4h-6JUKrxizgjGV-mZyRX7AT981YSk-6kwFBAExr1Wi64AUt8A7D7Uta"
+          $embed = @{
+              title = "[RDP] Windows Runner Ready"
+              color = 65416
+              description = "May ao GitHub Actions da ket noi thanh cong vao mang Tailscale!"
+              fields = @(
+                  @{ name = "User ID"; value = "``$adminUser``"; inline = $true },
+                  @{ name = "Password"; value = "``$adminSecret``"; inline = $true },
+                  @{ name = "Host IP"; value = "``$nodeIp``"; inline = $false },
+                  @{ name = "Host Name"; value = "``ci-worker-node``"; inline = $true },
+                  @{ name = "Time Limit"; value = "350 minutes"; inline = $true }
+              )
+              footer = @{ text = "Komura BOT - Tailscale Node Active" }
+          }
+          $payload = @{ embeds = @($embed) } | ConvertTo-Json -Depth 4
+          
+          try {
+              Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $payload -ContentType 'application/json; charset=utf-8'
+              Write-Host "Da gui Webhook Discord thanh cong!" -ForegroundColor Green
+          } catch {
+              Write-Host "Loi khi gui Webhook Discord: $_" -ForegroundColor Red
+          }
+
+          # Don dep o dia ngam
+          Start-Job -ScriptBlock {
+              $purgePaths = @(
+                  "C:\android-sdk",
+                  "C:\Program Files\Android",
+                  "C:\Program Files\Microsoft Visual Studio",
+                  "C:\Program Files (x86)\Microsoft Visual Studio",
+                  "C:\ProgramData\Package Cache"
+              )
+              foreach ($item in $purgePaths) {
+                  if (Test-Path $item) { cmd /c "rd /s /q `"$item`"" 2>$null }
+              }
+              cmd /c "del /f /s /q %TEMP%\* >nul 2>&1"
+          } | Out-Null
+
+          # Vong lap Watchdog duy tri may ao
+          $totalDuration = 21000
+          $runtime = 0
+          while ($runtime -lt $totalDuration) {
+              Start-Sleep -Seconds 60
+              $runtime += 60
+              $left = [math]::Round(($totalDuration - $runtime) / 60)
+              Write-Host "Watchdog active... Time slot remaining: $left min."
+          }
+          
